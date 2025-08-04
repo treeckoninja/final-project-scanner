@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# Assignment 4.2 
+# This script generates a security report by running a live nmap scan
+# against a target IP/hostname.
 
 #
 # --- Function Definitions ---
@@ -10,7 +11,7 @@
 # Description: Prints the main header for the report.
 # Arguments: $1 - The target IP address or hostname.
 write_header() {
-  local target="$1" # Assign the first argument to a local variable for clarity
+  local target="$1"
   cat << EOF
 =====================================================
       Network Security Scan Report
@@ -23,18 +24,21 @@ EOF
 }
 
 # Function: write_ports_section
-# Description: Prints the placeholder section for open ports.
+# Description: Runs an nmap scan and prints the open ports.
+# Arguments: $1 - The target IP address or hostname.
 write_ports_section() {
-  cat << EOF
------------------------------------------------------
-### 1. Open Ports and Detected Services ###
------------------------------------------------------
+  local target="$1"
+  # Print the static section header
+  echo "-----------------------------------------------------"
+  echo "### 1. Open Ports and Detected Services ###"
+  echo "-----------------------------------------------------"
+  echo "Scanning... please wait."
+  echo "" # Add a blank line for spacing
 
-Port 80/tcp   - http
-Port 443/tcp  - https
-Port 22/tcp   - ssh
-
-EOF
+  # Execute the nmap scan and filter for open ports.
+  # The output of this command pipeline is written to the report.
+  nmap -sV "$target" | grep "open"
+  echo "" # Add a blank line for spacing
 }
 
 # Function: write_vulns_section
@@ -81,9 +85,7 @@ EOF
 #              and calls the other functions to generate the report.
 main() {
   # --- Input Validation ---
-  # Check if exactly one argument was provided.
   if [ "$#" -ne 1 ]; then
-    # If not, print a usage message to standard error and exit.
     echo "Usage: $0 <target_ip_or_hostname>" >&2
     exit 1
   fi
@@ -92,22 +94,19 @@ main() {
   local target="$1"
   local report_file="vulnerability_report.txt"
 
-  # Call the functions in order to build the report.
-  # Use > for the first call to create/overwrite the file.
-  write_header "$target" > "$report_file"
+  echo "Starting network scan against $target..."
 
-  # Use >> for all subsequent calls to append to the file.
-  write_ports_section >> "$report_file"
+  # Call the functions in order to build the report.
+  write_header "$target" > "$report_file"
+  # Pass the target to the ports section function
+  write_ports_section "$target" >> "$report_file"
   write_vulns_section >> "$report_file"
   write_recs_section >> "$report_file"
   write_footer >> "$report_file"
 
-  # Print a confirmation message to the console.
   echo " Report for $target successfully generated: $report_file"
 }
 
 # --- Script Entry Point ---
-# This line calls the main function and passes all command-line arguments to it.
-# This is the only command that runs in the global scope.
 main "$@"
 
