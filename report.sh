@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # This script generates a security report by running an advanced nmap scan
-# to find open ports and known vulnerabilities.
+# and enriching the findings with data from the NIST NVD API.
 
 #
 # --- Function Definitions ---
@@ -28,75 +28,95 @@ EOF
 # Arguments: $1 - The full nmap scan results.
 write_ports_section() {
   local scan_results="$1"
-  # Print the static section header
   echo "-----------------------------------------------------"
   echo "### 1. Open Ports and Detected Services ###"
   echo "-----------------------------------------------------"
-  # Filter the results for lines containing "open"
   echo "$scan_results" | grep "open"
-  echo "" # Add a blank line for spacing
+  echo ""
 }
 
-# Function: write_vulns_section
-# Description: Analyzes scan results for potential vulnerabilities.
+# Function: query_nvd
+# Description: Queries the NVD API for CVEs related to a product and version.
+# Arguments: $1 - Product name, $2 - Product version
+query_nvd() {
+    local product="$1"
+    local version="$2"
+    local results_limit=3
+    
+    echo # Add a newline for formatting
+    echo "Querying NVD for vulnerabilities in: $product $version..."
+
+    # The API needs a URL-encoded string.
+    local search_query
+    search_query=$(echo "$product $version" | sed 's/ /%20/g')
+    local nvd_api_url="https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${search_query}&resultsPerPage=${results_limit}"
+
+    local vulnerabilities_json
+    vulnerabilities_json=$(curl -s "$nvd_api_url")
+
+    # --- Defensive Programming: Check for Errors ---
+    if [[ -z "$vulnerabilities_json" ]]; then
+        echo "  [!] Error: Failed to fetch data from NVD. The API might be down or unreachable."
+        return
+    fi
+    if echo "$vulnerabilities_json" | jq -e '.message' > /dev/null; then
+        echo "  [!] NVD API Error: $(echo "$vulnerabilities_json" | jq -r '.message')"
+        return
+    fi
+    if ! echo "$vulnerabilities_json" | jq -e '.vulnerabilities[0]' > /dev/null; then
+        echo "  [+] No vulnerabilities found in NVD for this keyword search."
+        return
+    fi
+    # --- End Error Checks ---
+
+    # This jq command filters and formats the JSON for our report.
+    echo "$vulnerabilities_json" | jq -r \
+        '.vulnerabilities[] |
+        "  CVE ID: \(.cve.id)\n  Description: \((.cve.descriptions[] | select(.lang=="en")).value | gsub("\n"; " "))\n  Severity: \(.cve.metrics.cvssMetricV31[0].cvssData.baseSeverity // .cve.metrics.cvssMetricV2[0].baseSeverity // "N/A")\n---"'
+}
+
+# Function: write_nvd_analysis
+# Description: Parses services and calls the NVD query function.
 # Arguments: $1 - The full nmap scan results.
-write_vulns_section() {
-  local scan_results="$1"
-  echo "-----------------------------------------------------"
-  echo "### 2. Potential Vulnerabilities Identified ###"
-  echo "-----------------------------------------------------"
+write_nvd_analysis() {
+    local scan_results="$1"
+    echo "-----------------------------------------------------"
+    echo "### 2. Live Vulnerability Analysis (NVD) ###"
+    echo "-----------------------------------------------------"
 
-  # Strategy A: Grep for high-confidence results from NSE
-  echo "--- High-Confidence Findings from Nmap Scripts ---"
-  echo "$scan_results" | grep "VULNERABLE" || echo "No high-confidence vulnerabilities found by NSE."
-  echo ""
+    # Process only the open port lines from the scan results
+    while read -r line; do
+        # Skip lines that don't contain service version info
+        if [[ ! "$line" =~ (OpenSSH|Apache|httpd) ]]; then
+            continue
+        fi
 
-  # Strategy B: Use conditional logic for specific version checks
-  echo "--- Analysis of Specific Service Versions ---"
-  # Process the full scan results line by line
-  local found_version_vuln=false
-  while read -r line; do
-    # Use a case statement to check for specific vulnerable versions
-    case "$line" in
-      *"vsftpd 2.3.4"*)
-        echo "[!!] VULNERABILITY DETECTED: vsftpd 2.3.4 is running, which contains a known critical backdoor."
-        found_version_vuln=true
-        ;;
-      *"Apache httpd 2.4.49"*)
-        echo "[!!] VULNERABILITY DETECTED: Apache 2.4.49 is running, which is vulnerable to path traversal (CVE-2021-41773)."
-        found_version_vuln=true
-        ;;
-      *"ProFTPD 1.3.5"*)
-        echo "[!!] VULNERABILITY DETECTED: ProFTPD 1.3.5 is running, which is vulnerable to remote command execution (CVE-2015-3306)."
-        found_version_vuln=true
-        ;;
-      *"OpenSSH 7.7"*)
-        echo "[!!] VULNERABILITY DETECTED: OpenSSH 7.7 is running, which is vulnerable to username enumeration (CVE-2018-15473)."
-        found_version_vuln=true
-        ;;
-    esac
-  done <<< "$scan_results" # Feed the scan results into the loop
+        local product=""
+        local version=""
 
-  if [ "$found_version_vuln" = false ]; then
-    echo "No specific vulnerable software versions found based on current checks."
-  fi
-  echo ""
+        # Use a case statement to reliably parse different service lines
+        case "$line" in
+            *OpenSSH*)
+                product="OpenSSH"
+                # Use awk to grab the version, which is the 4th field after the service name
+                version=$(echo "$line" | awk '{print $4}')
+                ;;
+            *Apache*|*httpd*)
+                product="Apache httpd"
+                # Use awk to find the version number, which often follows "Apache httpd"
+                version=$(echo "$line" | awk -F'Apache httpd ' '{print $2}' | awk '{print $1}')
+                ;;
+        esac
+
+        # If we successfully extracted a product and version, query the NVD
+        if [[ -n "$product" && -n "$version" ]]; then
+            query_nvd "$product" "$version"
+        fi
+
+    done <<< "$(echo "$scan_results" | grep "open")"
+    echo ""
 }
 
-# Function: write_recs_section
-# Description: Prints the placeholder section for recommendations.
-write_recs_section() {
-  cat << EOF
------------------------------------------------------
-### 3. Recommendations for Remediation ###
------------------------------------------------------
-
-- Review and patch all identified vulnerabilities immediately.
-- Update all software to the latest stable versions.
-- Implement a firewall and configure rules to restrict access.
-
-EOF
-}
 
 # Function: write_footer
 # Description: Prints the footer for the report.
@@ -111,30 +131,28 @@ EOF
 # Function: main
 # Description: The main controller of the script.
 main() {
-  # --- Input Validation ---
   if [ "$#" -ne 1 ]; then
     echo "Usage: $0 <target_ip_or_hostname>" >&2
     exit 1
   fi
 
-  # --- Script Execution ---
   local target="$1"
   local report_file="vulnerability_report.txt"
 
   echo "Starting advanced network scan against $target..."
   echo "This may take several minutes. Please wait."
 
-  # Run the enhanced nmap scan once and store the output in a variable
   local scan_results
-  scan_results=$(nmap -sV --script vuln "$target")
+  # Using -sV for version detection is crucial for the API query
+  scan_results=$(nmap -sV "$target")
 
   echo "Scan complete. Generating report..."
 
-  # Call the functions in order to build the report.
+  # Build the report section by section
   write_header "$target" > "$report_file"
   write_ports_section "$scan_results" >> "$report_file"
-  write_vulns_section "$scan_results" >> "$report_file"
-  write_recs_section >> "$report_file"
+  # Add the new NVD analysis section
+  write_nvd_analysis "$scan_results" >> "$report_file"
   write_footer >> "$report_file"
 
   echo "Report for $target successfully generated: $report_file"
